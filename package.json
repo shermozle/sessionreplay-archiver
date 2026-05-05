@@ -1,0 +1,12 @@
+{
+  "name": "sessionreplay-archiver",
+  "version": "1.0.0",
+  "description": "Archive and replay Amplitude Session Replays",
+  "scripts": {
+    "archive": "node archive.mjs",
+    "serve": "node serve.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
