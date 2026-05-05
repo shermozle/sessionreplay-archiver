@@ -173,8 +173,13 @@ async function main() {
 
   let manifest = [];
   if (existsSync(MANIFEST_PATH)) {
-    manifest = JSON.parse(await readFile(MANIFEST_PATH, "utf8"));
-    console.log(`Found existing manifest with ${manifest.length} entries\n`);
+    try {
+      const raw = await readFile(MANIFEST_PATH, "utf8");
+      if (raw.trim()) {
+        manifest = JSON.parse(raw);
+        console.log(`Found existing manifest with ${manifest.length} entries\n`);
+      }
+    } catch { /* corrupt manifest, start fresh */ }
   }
 
   console.log("Step 1: Listing all session replays...");
