@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Replay Player</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; height: 100vh; }
+    #sidebar { width: 340px; min-width: 340px; background: #1a1a1a; border-right: 1px solid #333; display: flex; flex-direction: column; overflow: hidden; }
+    #sidebar h1 { font-size: 16px; padding: 16px; border-bottom: 1px solid #333; color: #fff; }
+    #search { width: 100%; padding: 10px 16px; background: #222; border: none; border-bottom: 1px solid #333; color: #e0e0e0; font-size: 14px; outline: none; }
+    #search::placeholder { color: #666; }
+    #replay-list { flex: 1; overflow-y: auto; }
+    .replay-item { padding: 12px 16px; border-bottom: 1px solid #262626; cursor: pointer; transition: background 0.15s; }
+    .replay-item:hover { background: #252525; }
+    .replay-item.active { background: #1e3a5f; border-left: 3px solid #4a9eff; }
+    .replay-item .replay-id { font-size: 12px; font-family: monospace; color: #888; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .replay-item .replay-time { font-size: 13px; color: #ccc; }
+    .replay-item .replay-duration { font-size: 12px; color: #666; margin-top: 2px; }
+    .replay-item .replay-events { font-size: 11px; color: #555; }
+    #main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: auto; padding: 20px; }
+    #player-container { width: 100%; max-width: 1200px; }
+    #empty-state { text-align: center; color: #555; }
+    #empty-state h2 { font-size: 20px; margin-bottom: 8px; color: #666; }
+    #loading { display: none; color: #4a9eff; font-size: 14px; }
+    #error { display: none; color: #ff4a4a; font-size: 14px; padding: 16px; background: #2a1010; border-radius: 8px; }
+    #stats { padding: 12px 16px; border-top: 1px solid #333; font-size: 12px; color: #666; }
+    .rr-player { margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>Session Replays</h1>
+    <input type="text" id="search" placeholder="Search by ID, date, or user...">
+    <div id="replay-list"></div>
+    <div id="stats"></div>
+  </div>
+  <div id="main">
+    <div id="empty-state">
+      <h2>Select a replay</h2>
+      <p>Choose a session from the sidebar to play it back</p>
+    </div>
+    <div id="loading">Loading replay...</div>
+    <div id="error"></div>
+    <div id="player-container"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/index.js"></script>
+  <script>
+    let manifest = [];
+    let currentPlayer = null;
+
+    function formatDuration(startStr, endStr) {
+      if (!startStr || !endStr) return "unknown duration";
+      const ms = new Date(endStr) - new Date(startStr);
+      const secs = Math.floor(ms / 1000);
+      if (secs < 60) return `${secs}s`;
+      const mins = Math.floor(secs / 60);
+      const remSecs = secs % 60;
+      if (mins < 60) return `${mins}m ${remSecs}s`;
+      const hrs = Math.floor(mins / 60);
+      return `${hrs}h ${mins % 60}m`;
+    }
+
+    function formatDate(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      return d.toLocaleDateString() + " " + d.toLocaleTimeString();
+    }
+
+    function renderList(items) {
+      const list = document.getElementById("replay-list");
+      list.innerHTML = items
+        .map(
+          (r, i) => `
+        <div class="replay-item" data-index="${manifest.indexOf(r)}" title="${r.replay_id}">
+          <div class="replay-id">${r.replay_id}</div>
+          <div class="replay-time">${formatDate(r.start_time)}</div>
+          <div class="replay-duration">${formatDuration(r.start_time, r.end_time)}</div>
+          <div class="replay-events">${r.eventCount ?? "?"} events &middot; ${r.fileCount ?? "?"} files</div>
+        </div>`
+        )
+        .join("");
+
+      list.querySelectorAll(".replay-item").forEach((el) => {
+        el.addEventListener("click", () => loadReplay(parseInt(el.dataset.index)));
+      });
+
+      document.getElementById("stats").textContent = `${items.length} of ${manifest.length} replays`;
+    }
+
+    async function loadReplay(index) {
+      const replay = manifest[index];
+      if (!replay || !replay.dir) return;
+
+      document.querySelectorAll(".replay-item.active").forEach((el) => el.classList.remove("active"));
+      document.querySelector(`.replay-item[data-index="${index}"]`)?.classList.add("active");
+
+      const emptyState = document.getElementById("empty-state");
+      const loading = document.getElementById("loading");
+      const errorEl = document.getElementById("error");
+      const container = document.getElementById("player-container");
+
+      emptyState.style.display = "none";
+      errorEl.style.display = "none";
+      loading.style.display = "block";
+      container.innerHTML = "";
+
+      if (currentPlayer) {
+        currentPlayer = null;
+      }
+
+      try {
+        const res = await fetch(`replays/${replay.dir}/events.json`);
+        if (!res.ok) throw new Error(`Failed to load events: ${res.status}`);
+        const events = await res.json();
+
+        if (!events.length) {
+          throw new Error("No events found in this replay");
+        }
+
+        loading.style.display = "none";
+
+        const playerEl = document.createElement("div");
+        container.appendChild(playerEl);
+
+        currentPlayer = new rrwebPlayer({
+          target: playerEl,
+          props: {
+            events,
+            showController: true,
+            autoPlay: false,
+            speed: 1,
+            skipInactive: true,
+            showWarning: false,
+            mouseTail: true,
+          },
+        });
+      } catch (err) {
+        loading.style.display = "none";
+        errorEl.textContent = err.message;
+        errorEl.style.display = "block";
+      }
+    }
+
+    document.getElementById("search").addEventListener("input", (e) => {
+      const q = e.target.value.toLowerCase();
+      if (!q) return renderList(manifest);
+      const filtered = manifest.filter(
+        (r) =>
+          (r.replay_id || "").toLowerCase().includes(q) ||
+          (r.start_time || "").toLowerCase().includes(q) ||
+          (r.device_id || "").toLowerCase().includes(q) ||
+          String(r.amplitude_id || "").includes(q)
+      );
+      renderList(filtered);
+    });
+
+    async function init() {
+      try {
+        const res = await fetch("replays/manifest.json");
+        manifest = await res.json();
+        manifest = manifest.filter((r) => !r.error);
+        renderList(manifest);
+      } catch (err) {
+        document.getElementById("stats").textContent = "Failed to load manifest.json";
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
