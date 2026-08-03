@@ -4,7 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Session Replay Player</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css">
+  <!-- Pinned, not @latest: the 2.x tags publish no dist/ bundle, so @latest
+       served a JS build whose Svelte scoped class hashes didn't match the
+       stylesheet's. Every scoped rule silently failed, which left the seek bar
+       0px tall. Keep these two versions identical when upgrading. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@2.0.0-alpha.14/dist/style.css">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; height: 100vh; }
@@ -12,6 +16,10 @@
     #sidebar h1 { font-size: 16px; padding: 16px; border-bottom: 1px solid #333; color: #fff; }
     #search { width: 100%; padding: 10px 16px; background: #222; border: none; border-bottom: 1px solid #333; color: #e0e0e0; font-size: 14px; outline: none; }
     #search::placeholder { color: #666; }
+    #duration-filter { padding: 10px 16px; border-bottom: 1px solid #333; background: #1f1f1f; }
+    #duration-filter label { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #888; margin-bottom: 6px; }
+    #min-duration-value { color: #4a9eff; font-family: monospace; }
+    #min-duration { width: 100%; accent-color: #4a9eff; cursor: pointer; }
     #replay-list { flex: 1; overflow-y: auto; }
     .replay-item { padding: 12px 16px; border-bottom: 1px solid #262626; cursor: pointer; transition: background 0.15s; }
     .replay-item:hover { background: #252525; }
@@ -34,6 +42,13 @@
   <div id="sidebar">
     <h1>Session Replays</h1>
     <input type="text" id="search" placeholder="Search by ID, date, or user...">
+    <div id="duration-filter">
+      <label for="min-duration">
+        <span>Minimum duration</span>
+        <span id="min-duration-value">any</span>
+      </label>
+      <input type="range" id="min-duration" min="0" max="60" step="1" value="0">
+    </div>
     <div id="replay-list"></div>
     <div id="stats"></div>
   </div>
@@ -47,10 +62,56 @@
     <div id="player-container"></div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/index.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/rrweb-player@2.0.0-alpha.14/dist/index.js"></script>
   <script>
     let manifest = [];
     let currentPlayer = null;
+    let hiddenCount = 0;
+    let searchQuery = "";
+    let minDuration = 0;
+
+    // Some sessions carry corrupt timestamps (1970 or year-2120 dates, and a
+    // few end before they start), so their length can't be measured. Treat
+    // those as unknown and keep showing them rather than hiding them as if
+    // they were short.
+    function durationSeconds(replay) {
+      if (!replay.start_time || !replay.end_time) return null;
+      const ms = new Date(replay.end_time) - new Date(replay.start_time);
+      return Number.isFinite(ms) && ms >= 0 ? ms / 1000 : null;
+    }
+
+    function matchesSearch(replay, q) {
+      if (!q) return true;
+      return (
+        (replay.replay_id || "").toLowerCase().includes(q) ||
+        (replay.start_time || "").toLowerCase().includes(q) ||
+        (replay.device_id || "").toLowerCase().includes(q) ||
+        String(replay.amplitude_id || "").includes(q)
+      );
+    }
+
+    // Search text and the duration slider have to be applied together, or
+    // whichever one changed last would discard the other's filtering.
+    function applyFilters() {
+      const q = searchQuery.trim().toLowerCase();
+      renderList(
+        manifest.filter((replay) => {
+          if (!matchesSearch(replay, q)) return false;
+          if (!minDuration) return true;
+          const secs = durationSeconds(replay);
+          return secs === null || secs >= minDuration;
+        })
+      );
+    }
+
+    // rrweb's Replayer throws on fewer than two events, and a failed mount
+    // leaves the player unable to render any later replay until a reload, so
+    // these never belong in the list. Entries the archiver skipped record
+    // eventCount as "cached" rather than a number — their real length is only
+    // known once events.json is fetched, so loadReplay() checks again there.
+    function isPlayable(replay) {
+      return typeof replay.eventCount !== "number" || replay.eventCount >= 2;
+    }
 
     function formatDuration(startStr, endStr) {
       if (!startStr || !endStr) return "unknown duration";
@@ -88,7 +149,11 @@
         el.addEventListener("click", () => loadReplay(parseInt(el.dataset.index)));
       });
 
-      document.getElementById("stats").textContent = `${items.length} of ${manifest.length} replays`;
+      const hidden = hiddenCount
+        ? ` · ${hiddenCount} hidden (under 2 events)`
+        : "";
+      document.getElementById("stats").textContent =
+        `${items.length} of ${manifest.length} replays${hidden}`;
     }
 
     async function loadReplay(index) {
@@ -106,19 +171,35 @@
       emptyState.style.display = "none";
       errorEl.style.display = "none";
       loading.style.display = "block";
-      container.innerHTML = "";
 
+      // Destroy before emptying the container. Clearing innerHTML only removes
+      // the DOM — the Svelte component's replay loop keeps running, and since
+      // playback now starts on click, every switch would otherwise leave
+      // another replay playing in the background (skipInactive races them
+      // ahead at many times real time).
       if (currentPlayer) {
+        try {
+          currentPlayer.pause();
+          currentPlayer.$destroy();
+        } catch {
+          // A half-mounted player can throw on teardown; nothing to recover.
+        }
         currentPlayer = null;
       }
+
+      container.innerHTML = "";
 
       try {
         const res = await fetch(`replays/${replay.dir}/events.json`);
         if (!res.ok) throw new Error(`Failed to load events: ${res.status}`);
         const events = await res.json();
 
-        if (!events.length) {
-          throw new Error("No events found in this replay");
+        // Never hand fewer than two events to rrwebPlayer: it throws mid-mount
+        // and the container stays broken for every replay picked afterwards.
+        if (events.length < 2) {
+          throw new Error(
+            `This replay has only ${events.length} event${events.length === 1 ? "" : "s"} — playback needs at least 2.`
+          );
         }
 
         loading.style.display = "none";
@@ -131,7 +212,7 @@
           props: {
             events,
             showController: true,
-            autoPlay: false,
+            autoPlay: true,
             speed: 1,
             skipInactive: true,
             showWarning: false,
@@ -146,24 +227,24 @@
     }
 
     document.getElementById("search").addEventListener("input", (e) => {
-      const q = e.target.value.toLowerCase();
-      if (!q) return renderList(manifest);
-      const filtered = manifest.filter(
-        (r) =>
-          (r.replay_id || "").toLowerCase().includes(q) ||
-          (r.start_time || "").toLowerCase().includes(q) ||
-          (r.device_id || "").toLowerCase().includes(q) ||
-          String(r.amplitude_id || "").includes(q)
-      );
-      renderList(filtered);
+      searchQuery = e.target.value;
+      applyFilters();
+    });
+
+    document.getElementById("min-duration").addEventListener("input", (e) => {
+      minDuration = Number(e.target.value);
+      document.getElementById("min-duration-value").textContent =
+        minDuration ? `${minDuration}s or longer` : "any";
+      applyFilters();
     });
 
     async function init() {
       try {
         const res = await fetch("replays/manifest.json");
-        manifest = await res.json();
-        manifest = manifest.filter((r) => !r.error);
-        renderList(manifest);
+        const archived = (await res.json()).filter((r) => !r.error);
+        manifest = archived.filter(isPlayable);
+        hiddenCount = archived.length - manifest.length;
+        applyFilters();
       } catch (err) {
         document.getElementById("stats").textContent = "Failed to load manifest.json";
       }

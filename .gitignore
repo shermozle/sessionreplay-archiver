@@ -1,2 +1,7 @@
-.env
 node_modules/
+.DS_Store
+
+# Credentials: ignore every .env variant, but keep the placeholder template.
+# .env_budgetdirectdemo held live keys and was one `git add -A` from a public repo.
+.env*
+!.env.example
